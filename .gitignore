@@ -28,6 +28,7 @@ swanlog/
 # 你的本地数据集 (避免把几十万条 json 传进 git)
 data/
 *.json
+!ds_zero2.json
 *.jsonl
 *.csv
 

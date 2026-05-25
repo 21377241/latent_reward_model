@@ -1,0 +1,3 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: NO
+num_processes: 1

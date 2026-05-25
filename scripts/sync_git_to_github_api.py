@@ -48,23 +48,85 @@ def api(method: str, path: str, data: dict | None = None) -> dict:
         raise RuntimeError(f"{method} {path} -> HTTP {e.code}: {err}") from e
 
 
+SKIP_DIR_NAMES = {
+    ".git",
+    "__pycache__",
+    "experiments",
+    "data",
+    "swanlog",
+    "wandb",
+    "venv",
+    "env",
+    ".conda",
+    "output",
+    "logs",
+    "runs",
+}
+SKIP_FILE_NAMES = {"LatentMRM_code.zip"}
+
+
+def git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    cfg = Path("/tmp/latent_reward_model_gitconfig")
+    cfg.write_text(
+        "[safe]\n\tdirectory = *\n",
+        encoding="utf-8",
+    )
+    env["GIT_CONFIG_GLOBAL"] = str(cfg)
+    env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+    return env
+
+
 def git(*args: str) -> str:
     return subprocess.check_output(
-        ["git", "-C", str(ROOT), *args], text=True
+        ["git", "-C", str(ROOT), *args],
+        text=True,
+        env=git_env(),
     ).strip()
 
 
-def list_files_at_head() -> list[tuple[str, str]]:
-    """返回 (path, mode)。"""
-    lines = git("ls-tree", "-r", "HEAD").splitlines()
-    out = []
-    for line in lines:
-        meta, path = line.split("\t", 1)
-        mode, typ, _sha = meta.split()
-        if typ != "blob":
+def collect_files_from_disk() -> list[tuple[str, str]]:
+    """不依赖 git 可用性，按 .gitignore 规则遍历仓库文件。"""
+    out: list[tuple[str, str]] = []
+    for path in sorted(ROOT.rglob("*")):
+        if not path.is_file():
             continue
-        out.append((path, mode))
+        rel = path.relative_to(ROOT).as_posix()
+        parts = rel.split("/")
+        if any(p in SKIP_DIR_NAMES for p in parts):
+            continue
+        if path.name in SKIP_FILE_NAMES:
+            continue
+        if path.suffix in (".pyc", ".pyo"):
+            continue
+        if path.suffix in (".pth", ".pt", ".ckpt", ".safetensors", ".bin"):
+            continue
+        if path.suffix in (".jsonl", ".csv"):
+            continue
+        if path.suffix == ".json" and path.name != "ds_zero2.json":
+            continue
+        if path.suffix == ".json" and "tokenizer" in path.name:
+            continue
+        mode = "100755" if path.stat().st_mode & 0o111 else "100644"
+        out.append((rel, mode))
     return out
+
+
+def list_files_at_head() -> list[tuple[str, str]]:
+    """返回 (path, mode)；优先 git HEAD，失败则扫盘。"""
+    try:
+        lines = git("ls-tree", "-r", "HEAD").splitlines()
+        out = []
+        for line in lines:
+            meta, path = line.split("\t", 1)
+            mode, typ, _sha = meta.split()
+            if typ != "blob":
+                continue
+            out.append((path, mode))
+        return out
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"[warn] git 不可用 ({e})，改从磁盘收集文件", file=sys.stderr)
+        return collect_files_from_disk()
 
 
 def upload_blob(path: str) -> str:
@@ -79,7 +141,17 @@ def main() -> int:
         print("错误: 请设置 GITHUB_TOKEN（需 repo 权限）", file=sys.stderr)
         return 1
 
-    commit_msg = git("log", "-1", "--format=%B")
+    commit_msg = os.environ.get("COMMIT_MSG", "").strip()
+    if not commit_msg:
+        try:
+            commit_msg = git("log", "-1", "--format=%B")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            msg_file = ROOT / ".git" / "COMMIT_EDITMSG"
+            commit_msg = (
+                msg_file.read_text(encoding="utf-8").strip()
+                if msg_file.is_file()
+                else "Sync latent_reward_model"
+            )
     parent_sha = None
     try:
         ref = api("GET", f"/git/ref/heads/{BRANCH}")

@@ -1,16 +1,24 @@
 """
 Latent Reward Model 训练脚本（Accelerate + DeepSpeed ZeRO-2）
 
-启动示例（在仓库根目录下，复用 solution1/accel_ds2.yaml）：
-  cd /mnt/afs/250010036/reward_model/solution1
+启动示例（在本项目根目录下）：
+  cd /mnt/afs/250010036/reward_model/latent_reward_model
   accelerate launch --config_file accel_ds2.yaml \\
-      ../latent_reward_model/scripts/train_rm.py \\
+      scripts/train_rm.py \\
       --backbone_type llama3_baseline \\
       --output_dir ../latent_reward_model/experiments/test \\
       --batch_size 4 --grad_accum 8
 
 或使用 run_train.sh。
 """
+
+import sys
+from pathlib import Path
+
+# 从任意 cwd 启动时，需把 latent_reward_model 根目录加入 path
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import argparse
 import json
@@ -31,8 +39,30 @@ from utils.dataloader import build_loaders
 from utils.loss_functions import compute_latent_factor_loss
 from utils.optimizer import cosine_warmup
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True,
+)
 logger = logging.getLogger(__name__)
+
+
+def _setup_main_logging(log_file: str | None) -> None:
+    """主进程：同时写终端与文件，避免多卡时只有文件、终端长时间无输出。"""
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        logger.addHandler(sh)
+    if log_file and not any(
+        isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == log_file
+        for h in logger.handlers
+    ):
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 try:
     import swanlab
@@ -174,18 +204,27 @@ def main():
     set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    log_file = None
     if accelerator.is_main_process:
         gbs = accelerator.num_processes * args.grad_accum * args.batch_size
         log_file = os.path.join(
             args.output_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         )
-        logger.addHandler(logging.FileHandler(log_file, encoding="utf-8"))
+        _setup_main_logging(log_file)
         logger.info(vars(args))
         logger.info(
             "[Config] num_gpus=%s  global_batch_size=%s  %s",
             accelerator.num_processes,
             gbs,
             "OK" if gbs >= 512 else "WARNING: < 512，建议增大 grad_accum",
+        )
+        logger.info(
+            "[Config] logging_steps=%d  eval_steps=%d  grad_accum=%d  "
+            "（训练日志每 %d 个 optimizer step 打印一次）",
+            args.logging_steps,
+            args.eval_steps,
+            args.grad_accum,
+            args.logging_steps,
         )
 
     model_path = resolve_model_path(args.backbone_type, args.model_name_or_path)
@@ -197,9 +236,13 @@ def main():
     tokenizer.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     tokenizer.padding_side = "left"
 
+    if accelerator.is_main_process:
+        logger.info("[Data] 开始加载/清洗/tokenize 数据集（仅主进程，可能较久）…")
     with accelerator.main_process_first():
         train_loader, eval_loader = build_loaders(args, tokenizer)
 
+    if accelerator.is_main_process:
+        logger.info("[Model] 加载 backbone: %s", model_path)
     model = LatentRewardModel(
         model_path=model_path,
         backbone_type=args.backbone_type,
@@ -228,12 +271,26 @@ def main():
         model, optimizer, train_loader, eval_loader, scheduler
     )
 
+    if accelerator.is_main_process:
+        logger.info(
+            "[Train] 开始训练  epochs=%d  steps/epoch≈%d  total_steps≈%d  "
+            "micro_batches/epoch=%d",
+            args.num_epochs,
+            steps_per_epoch,
+            total_steps,
+            len(train_loader),
+        )
+        sys.stdout.flush()
+
     swan_run = swan_init(args) if accelerator.is_main_process else None
     global_step = 0
     best_acc = 0.0
     log_history = []
 
     for epoch in range(args.num_epochs):
+        if accelerator.is_main_process:
+            logger.info("[Train] ===== Epoch %d/%d =====", epoch + 1, args.num_epochs)
+            sys.stdout.flush()
         model.train()
         for step, batch in enumerate(train_loader):
             with accelerator.accumulate(model):
@@ -261,9 +318,9 @@ def main():
                     optimizer.zero_grad()
                     global_step += 1
 
-                    if (
-                        accelerator.is_main_process
-                        and global_step % args.logging_steps == 0
+                    if accelerator.is_main_process and (
+                        global_step == 1
+                        or global_step % args.logging_steps == 0
                     ):
                         lrs = scheduler.get_last_lr()
                         train_metrics = {
@@ -276,13 +333,17 @@ def main():
                         for k, v in stats.items():
                             train_metrics[f"train/{k}"] = v
                         logger.info(
-                            "[E%d S%d] loss=%.4f  lr_bb=%.2e  lr_h=%.2e",
+                            "[E%d S%d] loss=%.4f  L_heads=%.4f  L_sel=%.4f  "
+                            "lr_bb=%.2e  lr_h=%.2e",
                             epoch + 1,
                             global_step,
                             train_metrics["train/loss"],
+                            train_metrics["train/L_heads"],
+                            train_metrics["train/L_selector"],
                             lrs[0],
                             lrs[-1],
                         )
+                        sys.stdout.flush()
                         swan_log(swan_run, train_metrics, global_step)
 
                     if global_step % args.eval_steps == 0:

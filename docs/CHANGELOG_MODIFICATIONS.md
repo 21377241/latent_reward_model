@@ -4,7 +4,7 @@
 
 **文档日期**：2026-05-25（持续更新）  
 **对齐参考**：`baseline/singe_head.py`、`multihead_baseline/train_gated_multihead.py`  
-**Accelerate 配置**：`solution1/accel_ds2.yaml` + `solution1/ds_zero2.json`  
+**Accelerate 配置**：`latent_reward_model/accel_ds2.yaml` + `ds_zero2.json`（与 `solution1/` 同内容，本地启动）  
 **远程仓库**：[21377241/latent_reward_model](https://github.com/21377241/latent_reward_model)
 
 ---
@@ -119,12 +119,12 @@
 **`scripts/train_rm.py`**：手写训练循环，与 `baseline/singe_head.py` 同架构：
 
 ```bash
-cd /mnt/afs/250010036/reward_model/solution1
+cd /mnt/afs/250010036/reward_model/latent_reward_model
 accelerate launch --config_file accel_ds2.yaml \
     ../latent_reward_model/scripts/train_rm.py [参数...]
 ```
 
-或：`bash run_train.sh`（内部完成 `cd solution1` 与 launch）。
+或：`bash run_train.sh`（在 `latent_reward_model/` 下 launch）。
 
 | 项目 | 默认 / 说明 |
 |------|-------------|

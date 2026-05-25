@@ -32,32 +32,39 @@ latent_reward_model/
 
 ## 快速开始
 
-训练使用 **Accelerate launch + DeepSpeed ZeRO-2**（配置复用 `solution1/accel_ds2.yaml`）。
+训练使用 **Accelerate launch + DeepSpeed ZeRO-2**（配置见本目录 `accel_ds2.yaml`、`ds_zero2.json`）。
 
 ```bash
 cd /mnt/afs/250010036/reward_model/latent_reward_model
 PYTHONPATH=. python scripts/prepare_full_data.py
 
 # Llama3-8B（默认，4 卡 ZeRO-2）
+export SWANLAB_API_KEY="你的key"   # cloud 模式；未配置可用 SWANLAB_MODE=disabled
 bash run_train.sh
 
-# Llama3.1 / ArmoRM
+# Llama3.1 / ArmoRM（单 backbone）
 BACKBONE_TYPE=llama3.1_baseline bash run_train.sh
 BACKBONE_TYPE=armorm_baseline bash run_train.sh
+
+# 三个 backbone 串行（各独立 output_dir + SwanLab 实验名 LatentRewardModel_<backbone>）
+bash run_train_serial.sh
 ```
 
-手动启动（需在 `solution1/` 目录下，以便找到 `ds_zero2.json`）：
+手动启动（在本项目根目录）：
 
 ```bash
-cd /mnt/afs/250010036/reward_model/solution1
+cd /mnt/afs/250010036/reward_model/latent_reward_model
+export PYTHONPATH=.
 accelerate launch --config_file accel_ds2.yaml \
-  ../latent_reward_model/scripts/train_rm.py \
+  scripts/train_rm.py \
   --backbone_type llama3_baseline \
-  --train_data_path ../latent_reward_model/data/ultrafeedback_train.jsonl \
-  --eval_data_path ../latent_reward_model/data/ultrafeedback_val.jsonl \
-  --output_dir ../latent_reward_model/experiments/debug \
+  --train_data_path data/ultrafeedback_train.jsonl \
+  --eval_data_path data/ultrafeedback_val.jsonl \
+  --output_dir experiments/debug \
   --batch_size 4 --grad_accum 8
 ```
+
+单卡冒烟：`accelerate launch --config_file accel_1gpu.yaml scripts/train_rm.py ...`
 
 也可直接读 parquet（与 baseline 相同，跳过 jsonl）：
 
@@ -71,7 +78,7 @@ accelerate launch --config_file accel_ds2.yaml \
 
 - Python 3.10+
 - PyTorch、`transformers`, `datasets`, `accelerate`, `deepspeed`
-- 默认 **4 GPU + ZeRO-2 + bf16**（见 `solution1/ds_zero2.json`）
+- 默认 **4 GPU + ZeRO-2 + bf16**（见 `ds_zero2.json`）
 - 建议 `global_batch_size = num_gpus × batch_size × grad_accum ≥ 512`（与 baseline 一致）
 
 ## 数据与 Chat Template
@@ -108,9 +115,10 @@ PYTHONPATH=. python scripts/prepare_full_data.py
 
 | 参数 | 默认 |
 |------|------|
-| `--swanlab_project` | `latentMRM` |
-| `--swanlab_experiment_name` | `LatentRewardModel` |
-| `--swanlab_mode` | `cloud`（可选 `local` / `disabled`） |
+| `--swanlab_project` / `SWANLAB_PROJECT` | `latentMRM` |
+| `--swanlab_experiment_name` / `SWANLAB_EXPERIMENT_NAME` | `LatentRewardModel_<backbone>`（`run_train.sh` 按 backbone 自动生成） |
+| `--swanlab_mode` / `SWANLAB_MODE` | `cloud`（可选 `local` / `disabled`） |
+| `SWANLAB_API_KEY` | 环境变量注入，`run_train.sh` 不写死在脚本里 |
 
 本地运行日志仍会写入 `output_dir/train_*.log` 与 `log.json`。
 

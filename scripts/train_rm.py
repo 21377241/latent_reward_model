@@ -1,215 +1,340 @@
-import torch
+"""
+Latent Reward Model 训练脚本（Accelerate + DeepSpeed ZeRO-2）
+
+启动示例（在仓库根目录下，复用 solution1/accel_ds2.yaml）：
+  cd /mnt/afs/250010036/reward_model/solution1
+  accelerate launch --config_file accel_ds2.yaml \\
+      ../latent_reward_model/scripts/train_rm.py \\
+      --backbone_type llama3_baseline \\
+      --output_dir ../latent_reward_model/experiments/test \\
+      --batch_size 4 --grad_accum 8
+
+或使用 run_train.sh。
+"""
+
+import argparse
+import json
+import logging
+import math
 import os
-import wandb
-import dataclasses
-from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
-from transformers import AutoTokenizer, HfArgumentParser, Trainer, TrainingArguments
-from datasets import load_dataset
+from datetime import datetime
 
+import torch
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from transformers import AutoTokenizer
+
+from models.backbone import BACKBONE_CHOICES, resolve_model_path
 from models.latent_reward_model import LatentRewardModel
+from utils.checkpoint import save_latent_ckpt
+from utils.dataloader import build_loaders
 from utils.loss_functions import compute_latent_factor_loss
-from utils.metrics import get_compute_metrics_fn
+from utils.optimizer import cosine_warmup
 
-# ==========================================
-# 1. 定义自定义参数类 (加入 max_length)
-# ==========================================
-@dataclass
-class ScriptArguments:
-    """
-    除了 TrainingArguments 自带的训练参数外，定义我们特有的模型与数据参数
-    """
-    model_name_or_path: str = field(default="Qwen/Qwen2.5-0.5B", metadata={"help": "基础模型的路径或名称"})
-    train_data_path: str = field(default="data/dummy_preference.json", metadata={"help": "训练集路径"})
-    eval_data_path: Optional[str] = field(default=None, metadata={"help": "验证集路径，如果不传则使用训练集"})
-    max_length: int = field(default=1024, metadata={"help": "文本截断最大长度"})
-    
-    k_dimensions: int = field(default=4, metadata={"help": "潜在评价维度的数量 K"})
-    lambda_neg: float = field(default=1.0, metadata={"help": "反向维度损失的权重 \lambda_-"})
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-    num_pos_heads: int = field(default=4, metadata={"help": "每对样本中被划入正向集合的维度数量"})
-    target_tau: float = field(default=0.5, metadata={"help": "样本级正向维度的最小比例阈值 \tau"})
-    beta_dir: float = field(default=1.0, metadata={"help": "方向性惩罚 L_dir 的权重"})
+try:
+    import swanlab
+    _SWANLAB = True
+except ImportError:
+    _SWANLAB = False
 
-# ==========================================
-# 2. 自定义 Data Collator (处理 Pairwise 动态 Padding)
-# ==========================================
-class PairwiseDataCollator:
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
 
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        # 分离 chosen 和 rejected 的特征
-        chosen_features = [{"input_ids": f["input_ids_chosen"], "attention_mask": f["attention_mask_chosen"]} for f in features]
-        rejected_features = [{"input_ids": f["input_ids_rejected"], "attention_mask": f["attention_mask_rejected"]} for f in features]
+def get_args():
+    p = argparse.ArgumentParser(description="Latent MRM (Accelerate + ZeRO-2)")
 
-        # 利用 tokenizer 分别进行动态 padding
-        batch_chosen = self.tokenizer.pad(chosen_features, return_tensors="pt")
-        batch_rejected = self.tokenizer.pad(rejected_features, return_tensors="pt")
+    p.add_argument("--backbone_type", default="llama3_baseline", choices=list(BACKBONE_CHOICES))
+    p.add_argument("--model_name_or_path", default=None)
 
-        # 拼接成模型 forward 所需的格式
-        return {
-            "input_ids_c": batch_chosen["input_ids"],
-            "attention_mask_c": batch_chosen["attention_mask"],
-            "input_ids_r": batch_rejected["input_ids"],
-            "attention_mask_r": batch_rejected["attention_mask"],
-            "labels": torch.zeros(len(features), dtype=torch.long)
-        }
+    p.add_argument("--train_data_path", default=None, help="jsonl 训练集（prepare_full_data 输出）")
+    p.add_argument("--eval_data_path", default=None, help="jsonl 验证集")
+    p.add_argument("--train_data", default=None, help="parquet 训练集（与 baseline 相同）")
+    p.add_argument("--test_data", default=None, help="parquet 验证集")
 
-# ==========================================
-# 3. 继承基础 Trainer
-# ==========================================
-class LatentFactorRewardTrainer(Trainer):
-    def __init__(self, lambda_neg=1.0, beta_dir=0.1,target_tau=0.5,num_pos_heads=4,**kwargs):
-        super().__init__(**kwargs)
-        self.lambda_neg = lambda_neg
-        self.beta_dir = beta_dir
-        self.target_tau=target_tau
-        self.num_pos_heads=num_pos_heads
+    p.add_argument("--max_length", type=int, default=4096)
+    p.add_argument("--min_length", type=int, default=16)
+    p.add_argument("--min_score_margin", type=float, default=1.0)
+    p.add_argument("--min_chosen_score", type=float, default=4.0)
+    p.add_argument("--no_drop_score10", action="store_true")
 
-    def prediction_step(self,model,inputs,prediction_loss_only,ignore_keys=None,
-    ):
-        with torch.no_grad():
+    p.add_argument("--k_dimensions", type=int, default=8)
+    p.add_argument("--lambda_neg", type=float, default=1.0)
+    p.add_argument("--beta_dir", type=float, default=0.2)
+    p.add_argument("--target_tau", type=float, default=0.8)
+    p.add_argument("--num_pos_heads", type=int, default=5)
+
+    p.add_argument("--head_lr", type=float, default=1e-5)
+    p.add_argument("--backbone_lr", type=float, default=1e-7)
+    p.add_argument("--weight_decay", type=float, default=0.01)
+    p.add_argument("--warmup_ratio", type=float, default=0.05)
+
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--eval_batch_size", type=int, default=0)
+    p.add_argument("--grad_accum", type=int, default=8)
+    p.add_argument("--num_epochs", type=int, default=2)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
+    p.add_argument("--eval_steps", type=int, default=50)
+    p.add_argument("--logging_steps", type=int, default=10)
+    p.add_argument("--save_steps", type=int, default=500)
+    p.add_argument("--max_train_samples", type=int, default=0)
+    p.add_argument("--max_eval_samples", type=int, default=2000)
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--output_dir", default="./experiments/latent_mrm")
+    p.add_argument("--run_name", default=None, help="本地输出目录命名等，不用于 SwanLab 实验名")
+    p.add_argument("--swanlab_experiment_name", default="LatentRewardModel")
+    p.add_argument("--swanlab_project", default="latentMRM")
+    p.add_argument(
+        "--swanlab_mode",
+        default="cloud",
+        choices=["cloud", "local", "disabled"],
+        help="与 baseline 一致；disabled 时不记录 SwanLab",
+    )
+
+    args = p.parse_args()
+    args.drop_score10 = not args.no_drop_score10
+    return args
+
+
+def swan_init(args):
+    if not _SWANLAB or args.swanlab_mode == "disabled":
+        return None
+    return swanlab.init(
+        project=args.swanlab_project,
+        experiment_name=args.swanlab_experiment_name,
+        config=vars(args),
+        mode=args.swanlab_mode,
+    )
+
+
+def swan_log(run, metrics, step):
+    if run is None:
+        return
+    try:
+        run.log(metrics, step=step)
+    except Exception as e:
+        logger.warning("[SwanLab] %s", e)
+
+
+def swan_finish(run):
+    if run is None:
+        return
+    try:
+        run.finish()
+    except Exception:
+        pass
+
+
+@torch.no_grad()
+def evaluate(model, eval_loader, accelerator, args):
+    model.eval()
+    loss_sum = 0.0
+    metric_sums = {}
+    n_batches = 0
+
+    try:
+        for batch in eval_loader:
             scores_c, scores_r, relations = model(
-                input_ids_c=inputs["input_ids_c"],
-                attention_mask_c=inputs["attention_mask_c"],
-                input_ids_r=inputs["input_ids_r"],
-                attention_mask_r=inputs["attention_mask_r"]
+                input_ids_c=batch["input_ids_c"],
+                attention_mask_c=batch["attention_mask_c"],
+                input_ids_r=batch["input_ids_r"],
+                attention_mask_r=batch["attention_mask_r"],
             )
-
-            loss, _, _, _ = compute_latent_factor_loss(
+            loss, _, _, stats = compute_latent_factor_loss(
                 scores_c,
                 scores_r,
                 relations,
-                lambda_neg=self.lambda_neg,
-                beta_dir=self.beta_dir,
-                target_tau=self.target_tau
+                lambda_neg=args.lambda_neg,
+                beta_dir=args.beta_dir,
+                target_tau=args.target_tau,
+                num_pos_heads=args.num_pos_heads,
             )
+            loss_sum += loss.item()
+            for k, v in stats.items():
+                metric_sums[k] = metric_sums.get(k, 0.0) + float(v)
+            n_batches += 1
+    finally:
+        model.train()
 
-        logits = (
-            scores_c.detach(),
-            scores_r.detach(),
-            relations.detach(),
+    n_batches = max(n_batches, 1)
+    out = {"eval/loss": loss_sum / n_batches}
+    for k, v in metric_sums.items():
+        out[f"eval/{k.replace('/', '_')}"] = v / n_batches
+    if "eval/metrics_accuracy" in out:
+        out["eval/acc_global"] = out["eval/metrics_accuracy"]
+    return out
+
+
+def main():
+    args = get_args()
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
+    accelerator = Accelerator(gradient_accumulation_steps=args.grad_accum)
+    set_seed(args.seed)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    if accelerator.is_main_process:
+        gbs = accelerator.num_processes * args.grad_accum * args.batch_size
+        log_file = os.path.join(
+            args.output_dir, f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        logger.addHandler(logging.FileHandler(log_file, encoding="utf-8"))
+        logger.info(vars(args))
+        logger.info(
+            "[Config] num_gpus=%s  global_batch_size=%s  %s",
+            accelerator.num_processes,
+            gbs,
+            "OK" if gbs >= 512 else "WARNING: < 512，建议增大 grad_accum",
         )
 
-        labels = inputs["labels"]
-        return (loss.detach(), logits, labels)
+    model_path = resolve_model_path(args.backbone_type, args.model_name_or_path)
+    trust_remote_code = args.backbone_type == "armorm_baseline"
 
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, use_fast=True, trust_remote_code=trust_remote_code
+    )
+    tokenizer.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # inputs 字典的 key 已经由 data_collator 对齐到了模型的 forward 参数名
-        scores_c, scores_r, relations = model(
-            input_ids_c=inputs["input_ids_c"],
-            attention_mask_c=inputs["attention_mask_c"],
-            input_ids_r=inputs["input_ids_r"],
-            attention_mask_r=inputs["attention_mask_r"]
-        )
+    with accelerator.main_process_first():
+        train_loader, eval_loader = build_loaders(args, tokenizer)
 
-        loss,L_heads, L_selector, stats = compute_latent_factor_loss(
-            scores_c, scores_r, relations, 
-            lambda_neg=self.lambda_neg, 
-            beta_dir=self.beta_dir,
-            target_tau=self.target_tau
-        )
-
-        if self.model.training and self.state.global_step % self.args.logging_steps == 0:
-            log_dict = {
-                "loss/L_heads": L_heads.item(),
-                "loss/L_selector": L_selector.item(),
-                "loss/total": loss.item(),
-            }
-            log_dict.update(stats)
-            self.log(log_dict)
-
-        return loss
-
-
-# ==========================================
-# 4. 主入口逻辑
-# ==========================================
-if __name__ == "__main__":
-    parser = HfArgumentParser((ScriptArguments, TrainingArguments)) # 替换为 TrainingArguments
-    script_args, training_args = parser.parse_args_into_dataclasses()
-
-    if training_args.eval_strategy == "no":
-        # 如果你没在命令行传参数，默认让它每个 epoch 验证一次，或者设置 steps
-        training_args.eval_strategy = "steps"
-        training_args.eval_steps = 100 # 每 100 步在验证集上跑一次
-
-    training_args.report_to = ["wandb"]
-    training_args.remove_unused_columns = False
-    training_args.prediction_loss_only = False
-    if training_args.run_name is None:
-        # 如果你运行 bash 脚本时忘了加 --run_name，就给它一个动态的默认后备名称
-        model_short = script_args.model_name_or_path.split("/")[-1]
-        training_args.run_name = f"{model_short}-K{script_args.k_dimensions}-lamNeg{script_args.lambda_neg}"
-
-
-    # 必须设为 False，否则基础 Trainer 会把不属于模型基础 forward 参数列的纯文本给丢弃，导致 tokenize 失败
-    training_args.remove_unused_columns = False 
-
-    print(f" 初始化 Tokenizer 和模型: {script_args.model_name_or_path}")
-    tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right" 
-
-    target_dtype = torch.bfloat16 if training_args.bf16 else torch.float32
-    
     model = LatentRewardModel(
-        model_name=script_args.model_name_or_path, 
-        k_dimensions=script_args.k_dimensions,
-        torch_dtype=target_dtype
+        model_path=model_path,
+        backbone_type=args.backbone_type,
+        k_dimensions=args.k_dimensions,
+        torch_dtype=torch.bfloat16,
+    )
+    model.backbone.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    custom_config = dataclasses.asdict(script_args)
-    wandb.init(
-        project="latentMRM", 
-        name=training_args.run_name, 
-        config=custom_config 
+    head_params = list(model.reward_heads.parameters()) + list(model.selector.parameters())
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": list(model.backbone.parameters()), "lr": args.backbone_lr},
+            {"params": head_params, "lr": args.head_lr},
+        ],
+        weight_decay=args.weight_decay,
     )
 
-    print(f"加载数据集: {script_args.train_data_path}")
-    train_dataset = load_dataset("json", data_files=script_args.train_data_path, split="train")
-    if script_args.eval_data_path:
-        eval_dataset = load_dataset("json", data_files=script_args.eval_data_path, split="train")
-    else:
-        print("未提供 eval_data_path，使用 train_dataset 作为 eval_dataset")
-        eval_dataset = train_dataset
+    steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
+    total_steps = steps_per_epoch * args.num_epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    scheduler = cosine_warmup(optimizer, total_steps, warmup_steps)
 
-    # --- 将纯文本转换为 token_ids ---
-    def preprocess_function(examples):
-        text_chosen = [f"User: {p}\n\nAssistant: {c}" for p, c in zip(examples["prompt"], examples["chosen"])]
-        text_rejected = [f"User: {p}\n\nAssistant: {r}" for p, r in zip(examples["prompt"], examples["rejected"])]
-
-        # 这里不加 padding，由 collator 在 batch 级别动态 padding 节省显存
-        tokenized_chosen = tokenizer(text_chosen, truncation=True, max_length=script_args.max_length)
-        tokenized_rejected = tokenizer(text_rejected, truncation=True, max_length=script_args.max_length)
-
-        return {
-            "input_ids_chosen": tokenized_chosen["input_ids"],
-            "attention_mask_chosen": tokenized_chosen["attention_mask"],
-            "input_ids_rejected": tokenized_rejected["input_ids"],
-            "attention_mask_rejected": tokenized_rejected["attention_mask"],
-        }
-
-    print("正在对数据集进行 Tokenize 处理...")
-    train_dataset = train_dataset.map(preprocess_function, batched=True, num_proc=4)
-    eval_dataset = eval_dataset.map(preprocess_function, batched=True, num_proc=4)
-
-    trainer = LatentFactorRewardTrainer(
-        lambda_neg=script_args.lambda_neg,
-        beta_dir=script_args.beta_dir,
-        target_tau=script_args.target_tau,
-        num_pos_heads=script_args.num_pos_heads,
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=PairwiseDataCollator(tokenizer=tokenizer) ,# 传入自定义的批处理逻辑
-        compute_metrics=get_compute_metrics_fn(script_args.lambda_neg)
+    model, optimizer, train_loader, eval_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, eval_loader, scheduler
     )
 
-    trainer.train()
+    swan_run = swan_init(args) if accelerator.is_main_process else None
+    global_step = 0
+    best_acc = 0.0
+    log_history = []
 
-    wandb.finish()
+    for epoch in range(args.num_epochs):
+        model.train()
+        for step, batch in enumerate(train_loader):
+            with accelerator.accumulate(model):
+                scores_c, scores_r, relations = model(
+                    input_ids_c=batch["input_ids_c"],
+                    attention_mask_c=batch["attention_mask_c"],
+                    input_ids_r=batch["input_ids_r"],
+                    attention_mask_r=batch["attention_mask_r"],
+                )
+                loss, l_heads, l_sel, stats = compute_latent_factor_loss(
+                    scores_c,
+                    scores_r,
+                    relations,
+                    lambda_neg=args.lambda_neg,
+                    beta_dir=args.beta_dir,
+                    target_tau=args.target_tau,
+                    num_pos_heads=args.num_pos_heads,
+                )
+                accelerator.backward(loss)
+
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+
+                    if (
+                        accelerator.is_main_process
+                        and global_step % args.logging_steps == 0
+                    ):
+                        lrs = scheduler.get_last_lr()
+                        train_metrics = {
+                            "train/loss": loss.item(),
+                            "train/L_heads": l_heads.item(),
+                            "train/L_selector": l_sel.item(),
+                            "train/lr_backbone": lrs[0],
+                            "train/lr_head": lrs[-1],
+                        }
+                        for k, v in stats.items():
+                            train_metrics[f"train/{k}"] = v
+                        logger.info(
+                            "[E%d S%d] loss=%.4f  lr_bb=%.2e  lr_h=%.2e",
+                            epoch + 1,
+                            global_step,
+                            train_metrics["train/loss"],
+                            lrs[0],
+                            lrs[-1],
+                        )
+                        swan_log(swan_run, train_metrics, global_step)
+
+                    if global_step % args.eval_steps == 0:
+                        eval_stats = evaluate(model, eval_loader, accelerator, args)
+                        if accelerator.is_main_process:
+                            acc = eval_stats.get("eval/acc_global", eval_stats.get("eval/metrics_accuracy", 0.0))
+                            logger.info(
+                                "  ► eval loss=%.4f  acc_global=%.4f",
+                                eval_stats.get("eval/loss", 0.0),
+                                acc,
+                            )
+                            log_history.append({"step": global_step, **eval_stats})
+                            with open(os.path.join(args.output_dir, "log.json"), "w", encoding="utf-8") as f:
+                                json.dump(log_history, f, indent=2)
+                            swan_log(swan_run, eval_stats, global_step)
+
+                            if acc > best_acc:
+                                best_acc = acc
+                                save_latent_ckpt(
+                                    accelerator,
+                                    model,
+                                    scheduler,
+                                    global_step,
+                                    "best",
+                                    args.output_dir,
+                                    tokenizer,
+                                )
+                                logger.info("  ★ new best acc_global=%.4f", best_acc)
+
+                    if global_step % args.save_steps == 0 and accelerator.is_main_process:
+                        save_latent_ckpt(
+                            accelerator,
+                            model,
+                            scheduler,
+                            global_step,
+                            f"step_{global_step}",
+                            args.output_dir,
+                            tokenizer,
+                        )
+
+    if accelerator.is_main_process:
+        final_stats = evaluate(model, eval_loader, accelerator, args)
+        save_latent_ckpt(
+            accelerator, model, scheduler, global_step, "final", args.output_dir, tokenizer
+        )
+        summary = {"best_acc_global": best_acc, **final_stats}
+        with open(os.path.join(args.output_dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        logger.info("[Done] best_acc_global=%.4f", best_acc)
+        swan_log(swan_run, {"eval/final_acc_global": best_acc}, global_step)
+        swan_finish(swan_run)
+
+
+if __name__ == "__main__":
+    main()

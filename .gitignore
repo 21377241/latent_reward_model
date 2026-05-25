@@ -21,8 +21,9 @@ output/
 logs/
 runs/
 
-# Wandb 本地缓存
+# 实验跟踪本地缓存
 wandb/
+swanlog/
 
 # 你的本地数据集 (避免把几十万条 json 传进 git)
 data/

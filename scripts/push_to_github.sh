@@ -13,8 +13,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# AFS/NFS 上 root 操作他人仓库时避免「dubious ownership」
+export GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL:-/tmp/latent_reward_model_gitconfig}"
+if [[ ! -f "${GIT_CONFIG_GLOBAL}" ]]; then
+  printf '[safe]\n\tdirectory = *\n' > "${GIT_CONFIG_GLOBAL}"
+fi
+export GIT_CONFIG_SYSTEM="${GIT_CONFIG_SYSTEM:-/dev/null}"
+
 REPO_NAME="${GITHUB_REPO:-latent_reward_model}"
-OWNER="${GITHUB_OWNER:-}"
+OWNER="${GITHUB_OWNER:-21377241}"
 TOKEN="${GITHUB_TOKEN:-}"
 PRIVATE="${GITHUB_PRIVATE:-false}"
 BRANCH="${GITHUB_BRANCH:-main}"
@@ -62,5 +69,9 @@ else
   git remote add origin "$REMOTE_URL"
 fi
 
-git push -u origin "$BRANCH"
+if ! git push -u origin "$BRANCH"; then
+  echo "[提示] git push 失败时，可改用 GitHub API 同步（无需 443 git 协议）：" >&2
+  echo "  GITHUB_OWNER=${OWNER} GITHUB_REPO=${REPO_NAME} GITHUB_TOKEN=*** python scripts/sync_git_to_github_api.py" >&2
+  exit 1
+fi
 echo "已推送到 https://github.com/${OWNER}/${REPO_NAME}"

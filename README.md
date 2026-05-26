@@ -134,6 +134,51 @@ PYTHONPATH=. python scripts/prepare_full_data.py
 
 可通过 `--head_lr`、`--backbone_lr`、`--weight_decay`、`--warmup_ratio` 覆盖。
 
+## Checkpoint 与评测导出
+
+训练保存目录（如 `experiments/xxx/best/`）：
+
+| 文件 | 说明 |
+|------|------|
+| `model.safetensors` | backbone |
+| `latent_heads.pt` | reward_heads + selector + gating_network |
+| `latent_config.json` | 结构超参（K、gate、backbone_type 等），**评测必读** |
+| `meta.json` | step、tag、eval_acc_global |
+
+训练结束会自动导出 **`eval_export/best/`**（对接 reward-bench / `train_and_eval_all.sh`）：
+
+```bash
+PYTHONPATH=. python scripts/export_for_eval.py experiments/xxx/best
+# 或
+PYTHONPATH=. python -c "from utils.export_for_eval import export_latent_ckpt; export_latent_ckpt('experiments/xxx/best')"
+```
+
+训练时默认在 `best` 更新与结束时自动导出；可用 `--no_export_eval` 关闭。  
+默认输出：`experiments/xxx/eval_export/best/`（含 `export_done.json`）。
+
+HF 加载：
+
+```python
+from transformers import AutoModelForSequenceClassification
+model = AutoModelForSequenceClassification.from_pretrained(
+    "experiments/xxx/eval_export/best", trust_remote_code=True
+)
+```
+
+两阶段训练（推荐一条命令）：
+
+```bash
+bash run_train_two_stage.sh
+# NUM_POS_HEADS=7 SWANLAB_MODE=disabled bash run_train_two_stage.sh
+```
+
+默认输出目录（与 `run_train.sh` 的 `experiments/latent_mrm_llama3.1_baseline` 分离）：
+
+- 阶段1：`experiments/latent_mrm_llama3.1_baseline_k10_kplus7_2stage/`
+- 阶段2：`experiments/latent_mrm_llama3.1_baseline_k10_kplus7_2stage_gate/`
+
+或分步：`run_train.sh`（阶段1）→ `run_train_gate.sh`（阶段2）。
+
 ## 说明
 
 - **armorm** 通过 `AutoModelForSequenceClassification` 加载，仅使用其内部 `LlamaModel` 作为 backbone，不沿用 ArmoRM 原有 gating / score head。

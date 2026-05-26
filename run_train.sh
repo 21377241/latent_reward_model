@@ -16,7 +16,7 @@ fi
 LATENT_DIR="${REWARD_MODEL_ROOT:-/mnt/afs/250010036/reward_model}/latent_reward_model"
 ACCEL_CONFIG="${LATENT_DIR}/accel_ds2.yaml"
 
-BACKBONE_TYPE="${BACKBONE_TYPE:-llama3_baseline}"
+BACKBONE_TYPE="${BACKBONE_TYPE:-llama3.1_baseline}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-latent_mrm_${BACKBONE_TYPE}}"
 OUTPUT_DIR="${LATENT_DIR}/experiments/${EXPERIMENT_NAME}"
 mkdir -p "${OUTPUT_DIR}"
@@ -27,7 +27,7 @@ VAL_JSONL="${LATENT_DIR}/data/ultrafeedback_val.jsonl"
 
 # SwanLab（API Key 由环境变量注入，勿写入脚本）
 SWANLAB_PROJECT="${SWANLAB_PROJECT:-latentMRM}"
-SWANLAB_EXPERIMENT_NAME="${SWANLAB_EXPERIMENT_NAME:-LatentRewardModel_${BACKBONE_TYPE}}"
+SWANLAB_EXPERIMENT_NAME="${SWANLAB_EXPERIMENT_NAME:-${BACKBONE_TYPE}}"
 SWANLAB_MODE="${SWANLAB_MODE:-cloud}"
 if [[ -n "${SWANLAB_API_KEY:-}" ]]; then
   export SWANLAB_API_KEY
@@ -66,6 +66,7 @@ accelerate launch \
   --beta_dir 0.2 \
   --target_tau 0.8 \
   --num_pos_heads 10 \
+  --train_stage latent \
   --head_lr 1e-5 \
   --backbone_lr 1e-7 \
   --weight_decay 0.01 \
@@ -75,11 +76,12 @@ accelerate launch \
   --num_epochs 2 \
   --max_grad_norm 1.0 \
   --eval_steps 10 \
-  --logging_steps 10 \
+  --logging_steps 1 \
   --save_steps 500 \
   --max_length 4096 \
   --max_eval_samples 2000 \
+  --max_train_samples 0 \
   --run_name "${EXPERIMENT_NAME}" \
   --swanlab_project "${SWANLAB_PROJECT}" \
-  --swanlab_experiment_name "${SWANLAB_EXPERIMENT_NAME}" \
+  --swanlab_experiment_name "${SWANLAB_EXPERIMENT_NAME}_5000train_samples" \
   --swanlab_mode "${SWANLAB_MODE}"

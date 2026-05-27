@@ -35,6 +35,14 @@ if [[ -z "$TOKEN" ]]; then
   exit 1
 fi
 
+if [[ -x scripts/verify_repo_integrity.sh ]]; then
+  bash scripts/verify_repo_integrity.sh
+fi
+
+if [[ -x scripts/install_git_hooks.sh ]]; then
+  bash scripts/install_git_hooks.sh
+fi
+
 if [[ ! -d .git ]]; then
   git init -b "$BRANCH"
 fi
@@ -70,8 +78,12 @@ else
 fi
 
 if ! git push -u origin "$BRANCH"; then
-  echo "[提示] git push 失败时，可改用 GitHub API 同步（无需 443 git 协议）：" >&2
-  echo "  GITHUB_OWNER=${OWNER} GITHUB_REPO=${REPO_NAME} GITHUB_TOKEN=*** python scripts/sync_git_to_github_api.py" >&2
-  exit 1
+  echo "[提示] git push 失败，改用 GitHub API 同步..." >&2
+  export GITHUB_OWNER="${OWNER}"
+  export GITHUB_REPO="${REPO_NAME}"
+  export GITHUB_BRANCH="${BRANCH}"
+  export COMMIT_MSG="${COMMIT_MSG:-Sync latent_reward_model $(date -Iseconds)}"
+  python scripts/sync_git_to_github_api.py
+  exit $?
 fi
 echo "已推送到 https://github.com/${OWNER}/${REPO_NAME}"

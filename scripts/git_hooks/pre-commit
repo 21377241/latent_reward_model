@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# 阻止一次性删除大量 .py / .sh 源码（常见误操作）。
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "${ROOT}"
+
+if [[ -x scripts/verify_repo_integrity.sh ]]; then
+  bash scripts/verify_repo_integrity.sh || exit 1
+fi
+
+deleted="$(git diff --cached --name-only --diff-filter=D | grep -E '\.(py|sh)$' || true)"
+if [[ -z "${deleted}" ]]; then
+  exit 0
+fi
+
+count="$(echo "${deleted}" | wc -l | tr -d ' ')"
+MAX_DELETE="${GIT_HOOK_MAX_PY_SH_DELETE:-3}"
+
+if [[ "${count}" -gt "${MAX_DELETE}" ]]; then
+  echo "[pre-commit] 拒绝提交：将删除 ${count} 个 .py/.sh 文件（上限 ${MAX_DELETE}）" >&2
+  echo "${deleted}" | sed 's/^/  - /' >&2
+  echo "若确需批量删除，请: GIT_HOOK_MAX_PY_SH_DELETE=${count} git commit ..." >&2
+  exit 1
+fi
+
+exit 0

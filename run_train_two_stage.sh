@@ -9,6 +9,11 @@
 #
 #   NUM_POS_HEADS=7 SWANLAB_MODE=disabled bash run_train_two_stage.sh
 #
+#   阶段1 已有、只训 gate：
+#   SKIP_STAGE1=1 NUM_POS_HEADS=6 bash run_train_two_stage.sh
+#
+#   K+=5,6,8,9 批量两阶段+评测：bash run_kplus_sweep_train_eval.sh
+#
 # 默认不会写入 experiments/latent_mrm_llama3.1_baseline（旧实验 K+=10 全正向），
 # 而是独立目录，例如 experiments/latent_mrm_llama3.1_baseline_k10_kplus7_2stage/
 
@@ -23,7 +28,29 @@ if [[ -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]]; then
 fi
 
 LATENT_DIR="${REWARD_MODEL_ROOT:-/mnt/afs/250010036/reward_model}/latent_reward_model"
-ACCEL_CONFIG="${LATENT_DIR}/accel_ds2.yaml"
+
+# 按可见 GPU 数选择 Accelerate 配置（避免「只暴露 1 卡却 launch 4 进程」）
+_detect_num_gpus() {
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    local _s="${CUDA_VISIBLE_DEVICES// /}"
+    if [[ "${_s}" == *","* ]]; then
+      echo "${_s}" | awk -F, '{print NF}'
+      return
+    fi
+    echo 1
+    return
+  fi
+  nvidia-smi -L 2>/dev/null | wc -l || echo 1
+}
+
+_NUM_GPUS="$(_detect_num_gpus)"
+if [[ -z "${ACCEL_CONFIG:-}" ]]; then
+  if [[ "${_NUM_GPUS}" -ge 4 ]]; then
+    ACCEL_CONFIG="${LATENT_DIR}/accel_ds2.yaml"
+  else
+    ACCEL_CONFIG="${LATENT_DIR}/accel_1gpu.yaml"
+  fi
+fi
 
 # ─── 可配置超参（环境变量覆盖）────────────────────────────────────────────
 BACKBONE_TYPE="${BACKBONE_TYPE:-llama3.1_baseline}"
@@ -37,6 +64,7 @@ STAGE1_OUT="${STAGE1_OUT:-${LATENT_DIR}/experiments/${STAGE1_NAME}}"
 STAGE2_NAME="${STAGE2_NAME:-${STAGE1_NAME}_gate}"
 STAGE2_OUT="${STAGE2_OUT:-${LATENT_DIR}/experiments/${STAGE2_NAME}}"
 RESUME_TAG="${RESUME_TAG:-best}"
+SKIP_STAGE1="${SKIP_STAGE1:-0}"
 
 # 旧单阶段实验（run_train.sh 默认 num_pos_heads=10，目录名无 kplus 后缀）
 LEGACY_STAGE1_DIRS=(
@@ -138,31 +166,43 @@ echo " 两阶段 Latent MRM（独立实验目录，不覆盖 run_train.sh 默认
 echo "  backbone=${BACKBONE_TYPE}  K=${K_DIMENSIONS}  K+=${NUM_POS_HEADS}"
 echo "  阶段1 → ${STAGE1_OUT}"
 echo "  阶段2 → ${STAGE2_OUT}  (resume 本次阶段1: ${RESUME_FROM})"
-_NGPU=$(nvidia-smi -L 2>/dev/null | wc -l || echo 4)
-echo "  global_batch=$(( _NGPU * BATCH_SIZE * GRAD_ACCUM ))"
+echo "  ACCEL_CONFIG=${ACCEL_CONFIG}  visible_gpus=${_NUM_GPUS}"
+echo "  global_batch=$(( _NUM_GPUS * BATCH_SIZE * GRAD_ACCUM ))"
 echo "════════════════════════════════════════════════════════════"
 
 cd "${LATENT_DIR}"
 
 # ─── 阶段 1 ───────────────────────────────────────────────────────────────
-echo ""
-echo ">>> [阶段 1/2] train_stage=latent  epochs=${STAGE1_EPOCHS}"
-echo ""
+if [[ "${SKIP_STAGE1}" == "1" ]]; then
+  if [[ -f "${RESUME_FROM}/latent_heads.pt" ]]; then
+    echo ""
+    echo ">>> [阶段 1/2] 跳过（SKIP_STAGE1=1，使用已有 ${RESUME_FROM}）"
+    echo ""
+  else
+    echo "[错误] SKIP_STAGE1=1 但阶段1 checkpoint 不存在: ${RESUME_FROM}"
+    exit 1
+  fi
+else
+  echo ""
+  echo ">>> [阶段 1/2] train_stage=latent  epochs=${STAGE1_EPOCHS}"
+  echo ""
 
-# shellcheck disable=SC2046
-accelerate launch --config_file "${ACCEL_CONFIG}" \
-  scripts/train_rm.py \
-  $(_common_args) \
-  --output_dir "${STAGE1_OUT}" \
-  --train_stage latent \
-  --head_lr "${HEAD_LR}" \
-  --backbone_lr "${BACKBONE_LR}" \
-  --num_epochs "${STAGE1_EPOCHS}" \
-  --swanlab_experiment_name "${STAGE1_NAME}"
+  # shellcheck disable=SC2046
+  accelerate launch --config_file "${ACCEL_CONFIG}" \
+    scripts/train_rm.py \
+    $(_common_args) \
+    --output_dir "${STAGE1_OUT}" \
+    --train_stage latent \
+    --head_lr "${HEAD_LR}" \
+    --backbone_lr "${BACKBONE_LR}" \
+    --num_epochs "${STAGE1_EPOCHS}" \
+    --swanlab_experiment_name "${STAGE1_NAME}"
+fi
 
 if [[ ! -d "${RESUME_FROM}" ]] || [[ ! -f "${RESUME_FROM}/latent_heads.pt" ]]; then
   echo "[错误] 阶段1 未产生有效 checkpoint: ${RESUME_FROM}"
-  echo "  可尝试 RESUME_TAG=final bash run_train_two_stage.sh（仅重跑阶段2需另写）"
+  echo "  仅训阶段2: SKIP_STAGE1=1 bash run_train_two_stage.sh"
+  echo "  或尝试 RESUME_TAG=final"
   exit 1
 fi
 

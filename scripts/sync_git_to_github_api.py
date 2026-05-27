@@ -162,8 +162,16 @@ def main() -> int:
             raise
         print(f"远程尚无 {BRANCH}，将创建首条提交")
 
+    # 默认从磁盘收集，确保未 commit 的恢复/修改也会上传
+    if os.environ.get("SYNC_FROM_GIT", "").strip() in ("1", "true", "yes"):
+        file_list = list_files_at_head()
+        print(f"[sync] 使用 git HEAD，共 {len(file_list)} 个文件")
+    else:
+        file_list = collect_files_from_disk()
+        print(f"[sync] 使用磁盘扫描，共 {len(file_list)} 个文件")
+
     tree_entries = []
-    for path, mode in list_files_at_head():
+    for path, mode in file_list:
         blob_sha = upload_blob(path)
         tree_entries.append(
             {"path": path, "mode": mode, "type": "blob", "sha": blob_sha}

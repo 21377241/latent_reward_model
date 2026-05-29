@@ -115,6 +115,7 @@ def export_latent_ckpt(
     out_dir: Optional[Union[str, Path]] = None,
     *,
     pkg_root: Optional[Path] = None,
+    score_mode: Optional[str] = None,
 ) -> Path:
     """
     导出评测目录。
@@ -148,6 +149,9 @@ def export_latent_ckpt(
         if not heads_path.exists():
             raise FileNotFoundError(f"{CKPT_HEADS} not found: {heads_path}")
         latent_cfg = _infer_latent_config(heads_path)
+
+    if score_mode:
+        latent_cfg["score_mode"] = score_mode
 
     src_cfg_path = ckpt_tag_dir / "config.json"
     if not src_cfg_path.exists():

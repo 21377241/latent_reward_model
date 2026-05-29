@@ -48,6 +48,7 @@ class LatentRewardModel(nn.Module):
         k_dimensions: int = 4,
         torch_dtype: torch.dtype = torch.float32,
         use_gate: bool = False,
+        use_selector: bool = True,
         gate_hidden_size: int = 1024,
         gate_num_layers: int = 3,
         gate_temperature: float = 10.0,
@@ -55,6 +56,7 @@ class LatentRewardModel(nn.Module):
         super().__init__()
         self.backbone_type = backbone_type
         self.use_gate = use_gate
+        self.use_selector = use_selector
         self.backbone, self.config = load_backbone(
             model_path, backbone_type, torch_dtype=torch_dtype
         )
@@ -70,13 +72,15 @@ class LatentRewardModel(nn.Module):
             for _ in range(self.k)
         ])
 
-        self.selector = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, self.k),
-        )
+        if use_selector:
+            self.selector = nn.Sequential(
+                nn.Linear(hidden_size * 2, hidden_size),
+                nn.ReLU(),
+                nn.Linear(hidden_size, self.k),
+            ).to(torch_dtype)
+        else:
+            self.selector = None
         self.reward_heads = self.reward_heads.to(torch_dtype)
-        self.selector = self.selector.to(torch_dtype)
 
         if use_gate:
             self.gating_network = GatingNetwork(
@@ -119,10 +123,13 @@ class LatentRewardModel(nn.Module):
         scores_c = torch.cat([head(h_c) for head in self.reward_heads], dim=-1)
         scores_r = torch.cat([head(h_r) for head in self.reward_heads], dim=-1)
 
-        combined_features = torch.cat([h_c, h_r], dim=-1)
-        p_plus = torch.sigmoid(self.selector(combined_features))
-        p_minus = 1.0 - p_plus
-        relations = torch.stack([p_plus, p_minus], dim=-1)
+        if self.selector is not None:
+            combined_features = torch.cat([h_c, h_r], dim=-1)
+            p_plus = torch.sigmoid(self.selector(combined_features))
+            p_minus = 1.0 - p_plus
+            relations = torch.stack([p_plus, p_minus], dim=-1)
+        else:
+            relations = None
 
         gated_c, gated_r, gate_w_c, gate_w_r = None, None, None, None
         if self.use_gate:

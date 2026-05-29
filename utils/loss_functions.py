@@ -201,3 +201,118 @@ def compute_latent_factor_loss(
     
     return L_total, L_heads, L_selector, L_gate, stats
 
+
+def fixed_prefix_masks(
+    batch_size: int,
+    k_dim: int,
+    num_pos_heads: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """维度 0 .. num_pos_heads-1 为 K+（1），其余为 K-（1）。"""
+    if num_pos_heads < 0 or num_pos_heads > k_dim:
+        raise ValueError(f"num_pos_heads={num_pos_heads} 须在 [0, k_dim={k_dim}] 内")
+    m_plus = torch.zeros(batch_size, k_dim, device=device, dtype=dtype)
+    if num_pos_heads > 0:
+        m_plus[:, :num_pos_heads] = 1.0
+    m_minus = 1.0 - m_plus
+    return m_plus, m_minus
+
+
+def compute_fixed_prefix_loss(
+    scores_c,
+    scores_r,
+    num_pos_heads: int,
+    lambda_neg: float = 1.0,
+    gated_score_c=None,
+    gated_score_r=None,
+    lambda_gate: float = 0.0,
+    lambda_latent: float = 1.0,
+    gate_weights_c=None,
+):
+    """
+    无 selector：前 num_pos_heads 维为 K+，其余为 K-，仅 L_heads（+ 可选 L_gate）。
+    """
+    diff = scores_c - scores_r
+    b, k_dim = scores_c.shape
+    m_plus, m_minus = fixed_prefix_masks(
+        b, k_dim, num_pos_heads, scores_c.device, scores_c.dtype
+    )
+
+    loss_plus = -F.logsigmoid(diff)
+    loss_minus = -F.logsigmoid(-diff)
+
+    per_sample = (m_plus * loss_plus + lambda_neg * m_minus * loss_minus).sum(dim=-1)
+    L_heads = per_sample.mean()
+    L_selector = scores_c.new_zeros(())
+    L_heads_mean = (per_sample / max(k_dim, 1)).mean()
+
+    L_gate = scores_c.new_zeros(())
+    if gated_score_c is not None and lambda_gate > 0:
+        L_gate = -F.logsigmoid(gated_score_c - gated_score_r).mean()
+
+    L_total = lambda_latent * L_heads + lambda_gate * L_gate
+
+    with torch.no_grad():
+        den_plus = m_plus.sum(dim=-1).clamp(min=1.0)
+        den_minus = m_minus.sum(dim=-1).clamp(min=1.0)
+        correct_plus = (diff > 0).float()
+        correct_minus = (diff < 0).float()
+        reward_c_pseudo = (scores_c * m_plus).sum(dim=-1)
+        reward_r_pseudo = (scores_r * m_plus).sum(dim=-1)
+        reward_c_all = scores_c.sum(dim=-1)
+        reward_r_all = scores_r.sum(dim=-1)
+        if gated_score_c is not None:
+            margin_global = (gated_score_c - gated_score_r).mean().item()
+            acc_global = (gated_score_c > gated_score_r).float().mean().item()
+        else:
+            # 无 gate：acc_global = 全部 K 维求和的 pairwise acc（含 K- 维）
+            margin_global = (reward_c_all - reward_r_all).mean().item()
+            acc_global = (reward_c_all > reward_r_all).float().mean().item()
+
+        head_corr_c = pearson_head_offdiag_stats(scores_c, prefix="diag/head_corr_c")
+        head_corr_r = pearson_head_offdiag_stats(scores_r, prefix="diag/head_corr_r")
+        head_corr_diff = pearson_head_offdiag_stats(diff, prefix="diag/head_corr_diff")
+
+        stats = {
+            "loss/L_heads_mean": L_heads_mean.item(),
+            "loss/L_gate": L_gate.item() if lambda_gate > 0 else 0.0,
+            "loss/L_sel_plus": 0.0,
+            "loss/L_sel_minus": 0.0,
+            "diag/mean_delta_kplus": ((diff * m_plus).sum(dim=-1) / den_plus).mean().item(),
+            "diag/mean_delta_kminus": ((diff * m_minus).sum(dim=-1) / den_minus).mean().item(),
+            "diag/frac_wrong_kplus": (
+                (m_plus * (1.0 - correct_plus)).sum(dim=-1) / den_plus
+            ).mean().item(),
+            "diag/frac_wrong_kminus": (
+                (m_minus * (1.0 - correct_minus)).sum(dim=-1) / den_minus
+            ).mean().item(),
+            "diag/pos_dim_mode": 1.0,  # fixed_prefix
+            "diag/fixed_k_plus_end": float(num_pos_heads),
+            "metrics/acc_plus_heads": (
+                (m_plus * correct_plus).sum(dim=-1) / den_plus
+            ).mean().item(),
+            "metrics/acc_minus_heads": (
+                (m_minus * correct_minus).sum(dim=-1) / den_minus
+            ).mean().item(),
+            "metrics/margin": margin_global,
+            "metrics/accuracy": acc_global,
+            "metrics/acc_pseudo_kplus": (
+                (reward_c_pseudo > reward_r_pseudo).float().mean().item()
+            ),
+            "metrics/acc_all_dims_sum": (
+                (reward_c_all > reward_r_all).float().mean().item()
+            ),
+            "diag/k_dimensions": float(k_dim),
+            "diag/num_pos_heads": float(num_pos_heads),
+            **head_corr_c,
+            **head_corr_r,
+            **head_corr_diff,
+        }
+        if gate_weights_c is not None:
+            gw = gate_weights_c.clamp(min=1e-8)
+            stats["gate/entropy"] = (-(gw * torch.log(gw)).sum(dim=-1).mean()).item()
+            stats["gate/max_prob"] = gw.max(dim=-1).values.mean().item()
+
+    return L_total, L_heads, L_selector, L_gate, stats
+

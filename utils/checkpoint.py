@@ -17,21 +17,34 @@ CKPT_META = "meta.json"
 CKPT_LATENT_CONFIG = "latent_config.json"
 
 
+def _resolve_score_mode(use_gate: bool, use_selector: bool, pos_dim_mode: str) -> str:
+    if use_gate:
+        return "gated_scalar"
+    # 无 gate：评测标量 = 全部 K 维求和（与 fixed_latent 验证 acc_global 一致）
+    return "heads_sum"
+
+
 def build_latent_config(args, resume_from: str | None = None, eval_acc_global: float | None = None) -> Dict[str, Any]:
     """从训练 args 生成 latent_config.json 内容（评测/导出必读）。"""
     use_gate = getattr(args, "use_gate", False)
+    use_selector = getattr(args, "use_selector", True)
+    pos_dim_mode = getattr(args, "pos_dim_mode", None)
+    if pos_dim_mode is None:
+        pos_dim_mode = "selector" if use_selector else "fixed_prefix"
     cfg: Dict[str, Any] = {
         "model_type": "latent_reward_model",
         "backbone_type": args.backbone_type,
         "k_dimensions": args.k_dimensions,
         "num_pos_heads": args.num_pos_heads,
+        "use_selector": use_selector,
+        "pos_dim_mode": pos_dim_mode,
         "use_gate": use_gate,
         "gate_hidden_size": getattr(args, "gate_hidden_size", 1024),
         "gate_num_layers": getattr(args, "gate_num_layers", 3),
         "gate_temperature": getattr(args, "gate_temperature", 10.0),
         "train_stage": getattr(args, "train_stage", "latent"),
         "lambda_neg": getattr(args, "lambda_neg", 1.0),
-        "score_mode": "gated_scalar" if use_gate else "heads_sum",
+        "score_mode": _resolve_score_mode(use_gate, use_selector, pos_dim_mode),
     }
     if resume_from:
         cfg["resume_from"] = os.path.abspath(os.path.expanduser(resume_from))

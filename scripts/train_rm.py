@@ -42,7 +42,16 @@ from utils.checkpoint import (
 )
 from utils.export_for_eval import export_latent_ckpt
 from utils.dataloader import build_loaders
-from utils.loss_functions import compute_latent_factor_loss
+from utils.loss_functions import (
+    compute_fixed_prefix_loss,
+    compute_latent_factor_loss,
+)
+
+FIXED_PREFIX_STAGES = ("fixed_latent", "fixed_joint", "fixed_gate")
+
+
+def _uses_fixed_prefix(args) -> bool:
+    return args.train_stage in FIXED_PREFIX_STAGES
 from utils.optimizer import cosine_warmup
 
 logging.basicConfig(
@@ -104,8 +113,16 @@ def get_args():
     p.add_argument(
         "--train_stage",
         default="latent",
-        choices=["latent", "joint", "gate"],
-        help="latent=仅阶段1；joint=阶段1+gate BT；gate=仅训 gate（需 --use_gate）",
+        choices=[
+            "latent",
+            "joint",
+            "gate",
+            "fixed_latent",
+            "fixed_joint",
+            "fixed_gate",
+        ],
+        help="latent/joint/gate=原 selector 方案；"
+        "fixed_*=无 selector，维度 0..num_pos_heads-1 为 K+",
     )
     p.add_argument("--lambda_gate", type=float, default=1.0, help="gate BT 损失权重（joint/gate 阶段）")
     p.add_argument("--gate_hidden_size", type=int, default=1024)
@@ -165,10 +182,18 @@ def get_args():
     args.drop_score10 = not args.no_drop_score10
     if args.train_stage == "gate" and not args.use_gate:
         p.error("train_stage=gate 需要同时指定 --use_gate")
-    if args.train_stage == "joint" and not args.use_gate:
+    if args.train_stage == "fixed_gate" and not args.use_gate:
+        p.error("train_stage=fixed_gate 需要同时指定 --use_gate")
+    if args.train_stage in ("joint", "fixed_joint") and not args.use_gate:
         args.use_gate = True
-    if args.train_stage == "gate" and not args.resume_from:
-        p.error("train_stage=gate 必须指定 --resume_from（阶段1 的 best/final 目录）")
+    if args.train_stage in ("gate", "fixed_gate") and not args.resume_from:
+        p.error(f"train_stage={args.train_stage} 必须指定 --resume_from")
+    if args.num_pos_heads > args.k_dimensions:
+        p.error(
+            f"num_pos_heads({args.num_pos_heads}) 不能大于 k_dimensions({args.k_dimensions})"
+        )
+    args.use_selector = not _uses_fixed_prefix(args)
+    args.pos_dim_mode = "selector" if args.use_selector else "fixed_prefix"
     return args
 
 
@@ -176,30 +201,41 @@ def _resume_load_gate_flag(args):
     """阶段2 默认不加载 gate；joint/latent 续训则尽量加载。"""
     if args.resume_load_gate:
         return True
-    if args.train_stage == "gate":
+    if args.train_stage in ("gate", "fixed_gate"):
         return False
     return None
 
 
 def _loss_lambdas(args):
-    if args.train_stage == "gate":
+    if args.train_stage in ("gate", "fixed_gate"):
         return 0.0, args.lambda_gate
-    if args.train_stage == "joint":
+    if args.train_stage in ("joint", "fixed_joint"):
         return 1.0, args.lambda_gate
     return 1.0, 0.0
 
 
 def _configure_requires_grad(model, args):
     """按 train_stage 冻结/解冻子模块（在 accelerator.prepare 之前调用）。"""
-    train_latent = args.train_stage in ("latent", "joint")
-    train_gate = args.use_gate and args.train_stage in ("joint", "gate")
+    train_latent = args.train_stage in (
+        "latent",
+        "joint",
+        "fixed_latent",
+        "fixed_joint",
+    )
+    train_gate = args.use_gate and args.train_stage in (
+        "joint",
+        "gate",
+        "fixed_joint",
+        "fixed_gate",
+    )
 
     for p in model.backbone.parameters():
         p.requires_grad = train_latent
     for p in model.reward_heads.parameters():
         p.requires_grad = train_latent
-    for p in model.selector.parameters():
-        p.requires_grad = train_latent
+    if model.selector is not None:
+        for p in model.selector.parameters():
+            p.requires_grad = train_latent and args.use_selector
     if model.use_gate and model.gating_network is not None:
         for p in model.gating_network.parameters():
             p.requires_grad = train_gate
@@ -244,6 +280,18 @@ def _compute_loss(
     scores_c, scores_r, relations, gated_c, gated_r, gate_w_c, args
 ):
     lambda_latent, lambda_gate = _loss_lambdas(args)
+    if _uses_fixed_prefix(args):
+        return compute_fixed_prefix_loss(
+            scores_c,
+            scores_r,
+            num_pos_heads=args.num_pos_heads,
+            lambda_neg=args.lambda_neg,
+            gated_score_c=gated_c,
+            gated_score_r=gated_r,
+            lambda_gate=lambda_gate,
+            lambda_latent=lambda_latent,
+            gate_weights_c=gate_w_c,
+        )
     return compute_latent_factor_loss(
         scores_c,
         scores_r,
@@ -295,7 +343,7 @@ def evaluate(model, eval_loader, accelerator, args):
     loss_sum = 0.0
     metric_sums = {}
     n_batches = 0
-    detach_gate = args.train_stage == "gate"
+    detach_gate = args.train_stage in ("gate", "fixed_gate")
 
     try:
         for batch in eval_loader:
@@ -382,6 +430,7 @@ def main():
         k_dimensions=args.k_dimensions,
         torch_dtype=torch.bfloat16,
         use_gate=args.use_gate,
+        use_selector=args.use_selector,
         gate_hidden_size=args.gate_hidden_size,
         gate_num_layers=args.gate_num_layers,
         gate_temperature=args.gate_temperature,
@@ -399,10 +448,14 @@ def main():
 
     if accelerator.is_main_process:
         logger.info(
-            "[Model] use_gate=%s  train_stage=%s  k=%d  resume=%s",
+            "[Model] use_gate=%s  use_selector=%s  pos_dim_mode=%s  "
+            "train_stage=%s  k=%d  k+_prefix=%d  resume=%s",
             args.use_gate,
+            args.use_selector,
+            args.pos_dim_mode,
             args.train_stage,
             args.k_dimensions,
+            args.num_pos_heads,
             args.resume_from or "none",
         )
         if resume_info is not None:
@@ -413,12 +466,22 @@ def main():
     )
 
     param_groups = []
-    train_latent = args.train_stage in ("latent", "joint")
-    train_gate = args.use_gate and args.train_stage in ("joint", "gate")
+    train_latent = args.train_stage in (
+        "latent",
+        "joint",
+        "fixed_latent",
+        "fixed_joint",
+    )
+    train_gate = args.use_gate and args.train_stage in (
+        "joint",
+        "gate",
+        "fixed_joint",
+        "fixed_gate",
+    )
     if train_latent:
-        head_params = list(model.reward_heads.parameters()) + list(
-            model.selector.parameters()
-        )
+        head_params = list(model.reward_heads.parameters())
+        if model.selector is not None:
+            head_params += list(model.selector.parameters())
         param_groups.append(
             {"params": list(model.backbone.parameters()), "lr": args.backbone_lr}
         )
@@ -434,7 +497,8 @@ def main():
     if accelerator.is_main_process:
         group_names = []
         if train_latent:
-            group_names.extend(["backbone", "heads+selector"])
+            head_label = "heads+selector" if model.selector is not None else "heads"
+            group_names.extend(["backbone", head_label])
         if train_gate:
             group_names.append("gating_network")
         logger.info(
@@ -442,11 +506,18 @@ def main():
             group_names,
             [g["lr"] for g in param_groups],
         )
-        if args.train_stage == "gate":
+        if args.train_stage in ("gate", "fixed_gate"):
+            frozen = "backbone / heads" + (" / selector" if model.selector else "")
             logger.info(
-                "[Optim] train_stage=gate：backbone / heads / selector 已冻结，仅 gate_lr 生效"
+                "[Optim] train_stage=%s：%s 已冻结，仅 gate_lr 生效",
+                args.train_stage,
+                frozen,
             )
-
+        if _uses_fixed_prefix(args) and args.train_stage == "fixed_latent":
+            logger.info(
+                "[Optim] fixed_latent：K+ = 维度 [0, %d)，无 selector",
+                args.num_pos_heads,
+            )
     optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
     steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
@@ -481,7 +552,7 @@ def main():
             logger.info("[Train] ===== Epoch %d/%d =====", epoch + 1, args.num_epochs)
             sys.stdout.flush()
         model.train()
-        detach_gate = args.train_stage == "gate"
+        detach_gate = args.train_stage in ("gate", "fixed_gate")
         for step, batch in enumerate(train_loader):
             with accelerator.accumulate(model):
                 scores_c, scores_r, relations, gated_c, gated_r, gate_w_c, _ = (
@@ -516,7 +587,7 @@ def main():
                             train_metrics[f"train/{k}"] = v
                         logger.info(
                             "[E%d S%d] loss=%.4f  L_h=%.3f  L_h_mean=%.3f  L_sel=%.4f  "
-                            "L_gate=%.4f  acc=%.3f  wrong_k+=%.3f  p+=%.3f  "
+                            "L_gate=%.4f  acc=%.3f  wrong_k+=%.3f  "
                             "head_r|c|Δ=%.3f/%.3f/%.3f",
                             epoch + 1,
                             global_step,
@@ -527,7 +598,6 @@ def main():
                             train_metrics["train/L_gate"],
                             train_metrics.get("train/metrics/accuracy", 0.0),
                             train_metrics.get("train/diag/frac_wrong_kplus", 0.0),
-                            train_metrics.get("train/prob/p_plus", 0.0),
                             train_metrics.get("train/diag/head_corr_r_mean", 0.0),
                             train_metrics.get("train/diag/head_corr_c_mean", 0.0),
                             train_metrics.get("train/diag/head_corr_diff_mean", 0.0),
@@ -541,7 +611,7 @@ def main():
                             acc = eval_stats.get("eval/acc_global", eval_stats.get("eval/metrics_accuracy", 0.0))
                             logger.info(
                                 "  ► eval loss=%.4f  L_h_mean=%.3f  acc=%.3f  "
-                                "wrong_k+=%.3f  head_r|c|Δ=%.3f/%.3f/%.3f  p+=%.3f",
+                                "wrong_k+=%.3f  head_r|c|Δ=%.3f/%.3f/%.3f",
                                 eval_stats.get("eval/loss", 0.0),
                                 eval_stats.get("eval/loss_L_heads_mean", 0.0),
                                 acc,
@@ -550,7 +620,6 @@ def main():
                                 eval_stats.get("eval/diag/head_corr_r_mean", 0.0),
                                 eval_stats.get("eval/diag/head_corr_c_mean", 0.0),
                                 eval_stats.get("eval/diag/head_corr_diff_mean", 0.0),
-                                eval_stats.get("eval/prob/p_plus", 0.0),
                             )
                             log_history.append({"step": global_step, **eval_stats})
                             with open(os.path.join(args.output_dir, "log.json"), "w", encoding="utf-8") as f:

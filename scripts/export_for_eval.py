@@ -41,8 +41,16 @@ def main():
         default=None,
         help="导出目录（默认: <parent>/eval_export/<tag>）",
     )
+    parser.add_argument(
+        "--score_mode",
+        type=str,
+        default=None,
+        help="覆盖聚合方式，如 heads_mean（K 维等权平均）",
+    )
     args = parser.parse_args()
-    export_latent_ckpt(args.ckpt_tag_dir, args.out_dir)
+    export_latent_ckpt(
+        args.ckpt_tag_dir, args.out_dir, score_mode=args.score_mode
+    )
 
 
 if __name__ == "__main__":

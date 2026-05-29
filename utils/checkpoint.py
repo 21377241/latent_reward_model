@@ -24,7 +24,12 @@ def _resolve_score_mode(use_gate: bool, use_selector: bool, pos_dim_mode: str) -
     return "heads_sum"
 
 
-def build_latent_config(args, resume_from: str | None = None, eval_acc_global: float | None = None) -> Dict[str, Any]:
+def build_latent_config(
+    args,
+    resume_from: str | None = None,
+    eval_acc_global: float | None = None,
+    eval_loss: float | None = None,
+) -> Dict[str, Any]:
     """从训练 args 生成 latent_config.json 内容（评测/导出必读）。"""
     use_gate = getattr(args, "use_gate", False)
     use_selector = getattr(args, "use_selector", True)
@@ -42,6 +47,7 @@ def build_latent_config(args, resume_from: str | None = None, eval_acc_global: f
         "gate_hidden_size": getattr(args, "gate_hidden_size", 1024),
         "gate_num_layers": getattr(args, "gate_num_layers", 3),
         "gate_temperature": getattr(args, "gate_temperature", 10.0),
+        "gate_pooling_mode": getattr(args, "gate_pooling_mode", "sequence_end"),
         "train_stage": getattr(args, "train_stage", "latent"),
         "lambda_neg": getattr(args, "lambda_neg", 1.0),
         "score_mode": _resolve_score_mode(use_gate, use_selector, pos_dim_mode),
@@ -50,6 +56,8 @@ def build_latent_config(args, resume_from: str | None = None, eval_acc_global: f
         cfg["resume_from"] = os.path.abspath(os.path.expanduser(resume_from))
     if eval_acc_global is not None:
         cfg["eval_acc_global"] = float(eval_acc_global)
+    if eval_loss is not None:
+        cfg["eval_loss"] = float(eval_loss)
     return cfg
 
 
@@ -173,6 +181,7 @@ def save_latent_ckpt(
     tokenizer=None,
     latent_config: Optional[Dict[str, Any]] = None,
     eval_acc_global: Optional[float] = None,
+    eval_loss: Optional[float] = None,
 ):
     """
     保存 LatentRewardModel checkpoint：
@@ -239,6 +248,8 @@ def save_latent_ckpt(
             )
         if eval_acc_global is not None:
             meta["eval_acc_global"] = float(eval_acc_global)
+        if eval_loss is not None:
+            meta["eval_loss"] = float(eval_loss)
         with open(os.path.join(save_dir, CKPT_META), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 

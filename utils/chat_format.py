@@ -33,6 +33,27 @@ def build_conversation(
     ]
 
 
+def prompt_token_length(tokenizer, conversation: Conversation) -> int:
+    """
+    prompt / instruction 部分的 token 数（不含 assistant 回复正文）。
+    与完整序列拼接后 left-pad 时，prompt 结束下标 = offset + 返回值 - 1。
+    """
+    if not conversation:
+        return 0
+    if conversation[-1].get("role") == "assistant":
+        prefix_messages = conversation[:-1]
+        add_generation_prompt = True
+    else:
+        prefix_messages = conversation
+        add_generation_prompt = False
+    text = tokenizer.apply_chat_template(
+        prefix_messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+    return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
 def encode_conversation(tokenizer, conversation: Conversation) -> Dict[str, List[int]]:
     """
     apply_chat_template + tokenize（add_special_tokens=False）。

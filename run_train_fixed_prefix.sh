@@ -58,7 +58,7 @@ accelerate launch \
   --grad_accum 32 \
   --num_epochs 2 \
   --max_grad_norm 1.0 \
-  --eval_steps 10 \
+  --eval_steps 1 \
   --logging_steps 1 \
   --save_steps 500 \
   --max_length 4096 \

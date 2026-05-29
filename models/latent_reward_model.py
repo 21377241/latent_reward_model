@@ -1,9 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 from models.backbone import load_backbone
-from models.pooling import pool_last_hidden
+from models.pooling import pool_hidden_at_positions, pool_last_hidden
+
+GATE_POOLING_SEQUENCE_END = "sequence_end"
+GATE_POOLING_PROMPT_END = "prompt_end"
 
 
 class GatingNetwork(nn.Module):
@@ -52,11 +56,18 @@ class LatentRewardModel(nn.Module):
         gate_hidden_size: int = 1024,
         gate_num_layers: int = 3,
         gate_temperature: float = 10.0,
+        gate_pooling_mode: str = GATE_POOLING_SEQUENCE_END,
     ):
         super().__init__()
         self.backbone_type = backbone_type
         self.use_gate = use_gate
         self.use_selector = use_selector
+        if gate_pooling_mode not in (GATE_POOLING_SEQUENCE_END, GATE_POOLING_PROMPT_END):
+            raise ValueError(
+                f"gate_pooling_mode 须为 {GATE_POOLING_SEQUENCE_END!r} 或 "
+                f"{GATE_POOLING_PROMPT_END!r}，收到 {gate_pooling_mode!r}"
+            )
+        self.gate_pooling_mode = gate_pooling_mode
         self.backbone, self.config = load_backbone(
             model_path, backbone_type, torch_dtype=torch_dtype
         )
@@ -108,6 +119,7 @@ class LatentRewardModel(nn.Module):
         input_ids_r,
         attention_mask_r,
         detach_scores_for_gate: bool = False,
+        prompt_end_pos: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         out_c = self.backbone(
@@ -135,7 +147,21 @@ class LatentRewardModel(nn.Module):
         if self.use_gate:
             sc = scores_c.detach() if detach_scores_for_gate else scores_c
             sr = scores_r.detach() if detach_scores_for_gate else scores_r
-            gated_c, gate_w_c = self.aggregate_scores(h_c, sc)
-            gated_r, gate_w_r = self.aggregate_scores(h_r, sr)
+            if (
+                self.gate_pooling_mode == GATE_POOLING_PROMPT_END
+                and prompt_end_pos is not None
+            ):
+                # Gate 仅看 prompt/instruction 末 token 的 hidden（因果 LM 下与整段前向一致）
+                h_gate = pool_hidden_at_positions(
+                    out_c.last_hidden_state, prompt_end_pos
+                )
+                gate_w = self.gating_network(h_gate)
+                gated_c = (gate_w * sc).sum(dim=-1)
+                gated_r = (gate_w * sr).sum(dim=-1)
+                gate_w_c = gate_w
+                gate_w_r = gate_w
+            else:
+                gated_c, gate_w_c = self.aggregate_scores(h_c, sc)
+                gated_r, gate_w_r = self.aggregate_scores(h_r, sr)
 
         return scores_c, scores_r, relations, gated_c, gated_r, gate_w_c, gate_w_r

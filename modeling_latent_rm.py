@@ -81,6 +81,7 @@ class LlamaForLatentRewardModel(LlamaPreTrainedModel):
         gate_hidden_size = int(getattr(config, "gate_hidden_size", 1024))
         gate_num_layers = int(getattr(config, "gate_num_layers", 3))
         gate_temperature = float(getattr(config, "gate_temperature", 10.0))
+        self.gate_pooling_mode = getattr(config, "gate_pooling_mode", "sequence_end")
         # gated_scalar | heads_sum | heads_mean（K 维等权平均，即 sum/K）
         self.score_mode = getattr(config, "score_mode", "gated_scalar")
         self.num_pos_heads = int(getattr(config, "num_pos_heads", self.k_dimensions))
@@ -140,6 +141,9 @@ class LlamaForLatentRewardModel(LlamaPreTrainedModel):
             )
             model.use_selector = bool(lcfg.get("use_selector", model.use_selector))
             model.pos_dim_mode = lcfg.get("pos_dim_mode", model.pos_dim_mode)
+            model.gate_pooling_mode = lcfg.get(
+                "gate_pooling_mode", getattr(model, "gate_pooling_mode", "sequence_end")
+            )
             model.score_mode = lcfg.get("score_mode", model.score_mode)
 
         if os.path.isfile(heads_file):
@@ -155,7 +159,12 @@ class LlamaForLatentRewardModel(LlamaPreTrainedModel):
 
         return model
 
-    def _scalar_reward(self, hidden: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+    def _scalar_reward(
+        self,
+        hidden: torch.Tensor,
+        scores: torch.Tensor,
+        gate_hidden: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         mode = getattr(self, "score_mode", "gated_scalar")
         if mode == "heads_mean":
             return scores.mean(dim=-1)
@@ -165,7 +174,8 @@ class LlamaForLatentRewardModel(LlamaPreTrainedModel):
         if mode == "fixed_prefix_sum":
             mode = "heads_sum"
         if self.use_gate and self.gating_network is not None:
-            gate_w = self.gating_network(hidden)
+            h_gate = gate_hidden if gate_hidden is not None else hidden
+            gate_w = self.gating_network(h_gate)
             return (gate_w * scores).sum(dim=-1)
         # 兼容旧导出：无 gate 时默认各 head 求和
         return scores.sum(dim=-1)
@@ -215,8 +225,22 @@ class LlamaForLatentRewardModel(LlamaPreTrainedModel):
         head_dtype = self.reward_heads[0][0].weight.dtype
         last_h = last_h.to(head_dtype)
 
+        gate_hidden = None
+        prompt_end_positions = kwargs.get("prompt_end_positions")
+        if (
+            self.use_gate
+            and self.gating_network is not None
+            and getattr(self, "gate_pooling_mode", "sequence_end") == "prompt_end"
+            and prompt_end_positions is not None
+        ):
+            pos = prompt_end_positions.to(hidden.device, dtype=torch.long)
+            batch_size = hidden.size(0)
+            pos = pos.clamp(min=0, max=hidden.size(1) - 1)
+            gate_hidden = hidden[torch.arange(batch_size, device=hidden.device), pos]
+            gate_hidden = gate_hidden.to(head_dtype)
+
         scores = torch.cat([head(last_h) for head in self.reward_heads], dim=-1).float()
-        reward = self._scalar_reward(last_h, scores)
+        reward = self._scalar_reward(last_h, scores, gate_hidden=gate_hidden)
         logits = reward.unsqueeze(-1)
 
         if not return_dict:

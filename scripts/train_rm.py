@@ -128,6 +128,13 @@ def get_args():
     p.add_argument("--gate_hidden_size", type=int, default=1024)
     p.add_argument("--gate_num_layers", type=int, default=3)
     p.add_argument("--gate_temperature", type=float, default=10.0)
+    p.add_argument(
+        "--gate_pooling_mode",
+        default="sequence_end",
+        choices=["sequence_end", "prompt_end"],
+        help="sequence_end=gate 用序列末 token（默认）；"
+        "prompt_end=gate 仅用 prompt/instruction 末 token hidden，权重与 response 无关",
+    )
     p.add_argument("--gate_lr", type=float, default=0.0, help="0 表示与 head_lr 相同")
 
     p.add_argument("--head_lr", type=float, default=1e-5)
@@ -140,7 +147,7 @@ def get_args():
     p.add_argument("--grad_accum", type=int, default=8)
     p.add_argument("--num_epochs", type=int, default=2)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--eval_steps", type=int, default=50)
+    p.add_argument("--eval_steps", type=int, default=1)
     p.add_argument("--logging_steps", type=int, default=1)
     p.add_argument("--save_steps", type=int, default=500)
     p.add_argument("--max_train_samples", type=int, default=0)
@@ -242,20 +249,25 @@ def _configure_requires_grad(model, args):
 
 
 def _forward_batch(model, batch, detach_scores_for_gate: bool):
+    kwargs = {}
+    if "prompt_end_pos" in batch:
+        kwargs["prompt_end_pos"] = batch["prompt_end_pos"]
     return model(
         input_ids_c=batch["input_ids_c"],
         attention_mask_c=batch["attention_mask_c"],
         input_ids_r=batch["input_ids_r"],
         attention_mask_r=batch["attention_mask_r"],
         detach_scores_for_gate=detach_scores_for_gate,
+        **kwargs,
     )
 
 
-def _make_latent_config(args, eval_acc_global=None):
+def _make_latent_config(args, eval_acc_global=None, eval_loss=None):
     return build_latent_config(
         args,
         resume_from=args.resume_from,
         eval_acc_global=eval_acc_global,
+        eval_loss=eval_loss,
     )
 
 
@@ -393,9 +405,11 @@ def main():
         )
         logger.info(
             "[Config] logging_steps=%d  eval_steps=%d  grad_accum=%d  "
-            "（训练日志每 %d 个 optimizer step 打印一次）",
+            "（train/loss 等为每 optimizer step 内 %d 个 micro-batch 平均；"
+            "每 %d 个 optimizer step 打印一次；best 按 eval/loss 最低保存）",
             args.logging_steps,
             args.eval_steps,
+            args.grad_accum,
             args.grad_accum,
             args.logging_steps,
         )
@@ -434,6 +448,7 @@ def main():
         gate_hidden_size=args.gate_hidden_size,
         gate_num_layers=args.gate_num_layers,
         gate_temperature=args.gate_temperature,
+        gate_pooling_mode=args.gate_pooling_mode,
     )
     _configure_requires_grad(model, args)
 
@@ -448,9 +463,10 @@ def main():
 
     if accelerator.is_main_process:
         logger.info(
-            "[Model] use_gate=%s  use_selector=%s  pos_dim_mode=%s  "
+            "[Model] use_gate=%s  gate_pooling=%s  use_selector=%s  pos_dim_mode=%s  "
             "train_stage=%s  k=%d  k+_prefix=%d  resume=%s",
             args.use_gate,
+            args.gate_pooling_mode,
             args.use_selector,
             args.pos_dim_mode,
             args.train_stage,
@@ -544,7 +560,7 @@ def main():
     global_step = 0
     if resume_info and resume_info.get("meta"):
         global_step = int(resume_info["meta"].get("step", 0))
-    best_acc = 0.0
+    best_eval_loss = float("inf")
     log_history = []
 
     for epoch in range(args.num_epochs):
@@ -553,6 +569,9 @@ def main():
             sys.stdout.flush()
         model.train()
         detach_gate = args.train_stage in ("gate", "fixed_gate")
+        acc_loss = acc_l_heads = acc_l_sel = acc_l_gate = 0.0
+        acc_stats: dict[str, float] = {}
+        acc_n = 0
         for step, batch in enumerate(train_loader):
             with accelerator.accumulate(model):
                 scores_c, scores_r, relations, gated_c, gated_r, gate_w_c, _ = (
@@ -562,6 +581,14 @@ def main():
                     scores_c, scores_r, relations, gated_c, gated_r, gate_w_c, args
                 )
                 accelerator.backward(loss)
+
+                acc_loss += loss.item()
+                acc_l_heads += l_heads.item()
+                acc_l_sel += l_sel.item()
+                acc_l_gate += l_gate.item()
+                for k, v in stats.items():
+                    acc_stats[k] = acc_stats.get(k, 0.0) + float(v)
+                acc_n += 1
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -575,16 +602,17 @@ def main():
                         or global_step % args.logging_steps == 0
                     ):
                         lrs = scheduler.get_last_lr()
+                        n = max(acc_n, 1)
                         train_metrics = {
-                            "train/loss": loss.item(),
-                            "train/L_heads": l_heads.item(),
-                            "train/L_selector": l_sel.item(),
-                            "train/L_gate": l_gate.item(),
+                            "train/loss": acc_loss / n,
+                            "train/L_heads": acc_l_heads / n,
+                            "train/L_selector": acc_l_sel / n,
+                            "train/L_gate": acc_l_gate / n,
                             "train/lr_backbone": lrs[0] if len(lrs) > 1 else lrs[0],
                             "train/lr_head": lrs[-1],
                         }
-                        for k, v in stats.items():
-                            train_metrics[f"train/{k}"] = v
+                        for k, v in acc_stats.items():
+                            train_metrics[f"train/{k}"] = v / n
                         logger.info(
                             "[E%d S%d] loss=%.4f  L_h=%.3f  L_h_mean=%.3f  L_sel=%.4f  "
                             "L_gate=%.4f  acc=%.3f  wrong_k+=%.3f  "
@@ -604,6 +632,10 @@ def main():
                         )
                         sys.stdout.flush()
                         swan_log(swan_run, train_metrics, global_step)
+
+                    acc_loss = acc_l_heads = acc_l_sel = acc_l_gate = 0.0
+                    acc_stats = {}
+                    acc_n = 0
 
                     if global_step % args.eval_steps == 0:
                         eval_stats = evaluate(model, eval_loader, accelerator, args)
@@ -626,8 +658,9 @@ def main():
                                 json.dump(log_history, f, indent=2)
                             swan_log(swan_run, eval_stats, global_step)
 
-                            if acc > best_acc:
-                                best_acc = acc
+                            eval_loss = eval_stats.get("eval/loss", float("inf"))
+                            if eval_loss < best_eval_loss:
+                                best_eval_loss = eval_loss
                                 save_latent_ckpt(
                                     accelerator,
                                     model,
@@ -637,11 +670,18 @@ def main():
                                     args.output_dir,
                                     tokenizer,
                                     latent_config=_make_latent_config(
-                                        args, eval_acc_global=best_acc
+                                        args,
+                                        eval_loss=best_eval_loss,
+                                        eval_acc_global=acc,
                                     ),
-                                    eval_acc_global=best_acc,
+                                    eval_loss=best_eval_loss,
+                                    eval_acc_global=acc,
                                 )
-                                logger.info("  ★ new best acc_global=%.4f", best_acc)
+                                logger.info(
+                                    "  ★ new best eval_loss=%.4f  acc_global=%.4f",
+                                    best_eval_loss,
+                                    acc,
+                                )
                                 if not args.no_export_eval:
                                     _export_eval_ckpt(
                                         os.path.join(args.output_dir, "best")
@@ -661,6 +701,10 @@ def main():
 
     if accelerator.is_main_process:
         final_stats = evaluate(model, eval_loader, accelerator, args)
+        final_acc = final_stats.get(
+            "eval/acc_global", final_stats.get("eval/metrics_accuracy", 0.0)
+        )
+        final_loss = final_stats.get("eval/loss", float("inf"))
         save_latent_ckpt(
             accelerator,
             model,
@@ -669,20 +713,27 @@ def main():
             "final",
             args.output_dir,
             tokenizer,
-            latent_config=_make_latent_config(args, eval_acc_global=best_acc),
-            eval_acc_global=best_acc,
+            latent_config=_make_latent_config(
+                args, eval_loss=final_loss, eval_acc_global=final_acc
+            ),
+            eval_loss=final_loss,
+            eval_acc_global=final_acc,
         )
-        summary = {"best_acc_global": best_acc, **final_stats}
+        summary = {"best_eval_loss": best_eval_loss, **final_stats}
         with open(os.path.join(args.output_dir, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
-        logger.info("[Done] best_acc_global=%.4f", best_acc)
+        logger.info("[Done] best_eval_loss=%.4f", best_eval_loss)
         if not args.no_export_eval:
             best_dir = os.path.join(args.output_dir, "best")
             if os.path.isdir(best_dir):
                 _export_eval_ckpt(best_dir)
             else:
                 _export_eval_ckpt(os.path.join(args.output_dir, "final"))
-        swan_log(swan_run, {"eval/final_acc_global": best_acc}, global_step)
+        swan_log(
+            swan_run,
+            {"eval/best_eval_loss": best_eval_loss, "eval/final_loss": final_loss},
+            global_step,
+        )
         swan_finish(swan_run)
 
 

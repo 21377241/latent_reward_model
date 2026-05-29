@@ -40,9 +40,11 @@ def load_from_ckpt(ckpt_dir: str, device: str = "cuda") -> LatentRewardModel:
         k_dimensions=lcfg["k_dimensions"],
         torch_dtype=torch.bfloat16,
         use_gate=lcfg.get("use_gate", False),
+        use_selector=lcfg.get("use_selector", True),
         gate_hidden_size=lcfg.get("gate_hidden_size", 1024),
         gate_num_layers=lcfg.get("gate_num_layers", 3),
         gate_temperature=lcfg.get("gate_temperature", 10.0),
+        gate_pooling_mode=lcfg.get("gate_pooling_mode", "sequence_end"),
     )
     load_latent_ckpt(model, ckpt_dir, load_gate=lcfg.get("use_gate", True))
     model.eval()
@@ -57,6 +59,7 @@ def main():
     model = load_from_ckpt(args.ckpt_dir, args.device)
     print(
         f"loaded k={model.k} use_gate={model.use_gate} "
+        f"gate_pooling={model.gate_pooling_mode} "
         f"from {resolve_ckpt_dir(args.ckpt_dir)}"
     )
 

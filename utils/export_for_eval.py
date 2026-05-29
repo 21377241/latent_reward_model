@@ -202,6 +202,7 @@ def export_latent_ckpt(
         "gate_hidden_size",
         "gate_num_layers",
         "gate_temperature",
+        "gate_pooling_mode",
         "backbone_type",
         "score_mode",
         "train_stage",

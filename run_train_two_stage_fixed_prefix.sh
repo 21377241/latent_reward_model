@@ -112,7 +112,7 @@ _common_args() {
     --batch_size "${BATCH_SIZE}" \
     --grad_accum "${GRAD_ACCUM}" \
     --max_grad_norm 1.0 \
-    --eval_steps 10 \
+    --eval_steps 1 \
     --logging_steps 1 \
     --save_steps 500 \
     --max_length 4096 \

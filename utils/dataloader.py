@@ -2,13 +2,19 @@
 
 import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Tuple
 
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 
-from utils.chat_format import build_conversation, encode_conversation, passes_length_filter
+from models.pooling import prompt_end_positions_left_pad
+from utils.chat_format import (
+    build_conversation,
+    encode_conversation,
+    passes_length_filter,
+    prompt_token_length,
+)
 from utils.ultrafeedback_clean import UltrafeedbackCleanConfig, clean_ultrafeedback_dataset
 
 logger = logging.getLogger(__name__)
@@ -45,7 +51,7 @@ def _tokenize_dataset(ds, tokenizer, max_length: int, min_length: int, split: st
     def tokenize_batch(examples):
         n = len(examples["chosen"])
         prompts = examples.get("prompt", [""] * n)
-        out = {"c_ids": [], "c_mask": [], "r_ids": [], "r_mask": []}
+        out = {"c_ids": [], "c_mask": [], "r_ids": [], "r_mask": [], "prompt_len": []}
         for i in range(n):
             conv_c = build_conversation(examples["chosen"][i], prompts[i])
             conv_r = build_conversation(examples["rejected"][i], prompts[i])
@@ -55,6 +61,8 @@ def _tokenize_dataset(ds, tokenizer, max_length: int, min_length: int, split: st
             out["c_mask"].append(tok_c["attention_mask"])
             out["r_ids"].append(tok_r["input_ids"])
             out["r_mask"].append(tok_r["attention_mask"])
+            # prompt 边界以 chosen 侧为准（与 rejected 通常共享同一 instruction）
+            out["prompt_len"].append(prompt_token_length(tokenizer, conv_c))
         return out
 
     ds = ds.map(tokenize_batch, batched=True, num_proc=4, desc=f"tokenize {split}")
@@ -112,11 +120,17 @@ def build_loaders(args, tokenizer) -> Tuple[DataLoader, DataLoader]:
 
         c_ids, c_mask = pad_left([x["c_ids"] for x in batch])
         r_ids, r_mask = pad_left([x["r_ids"] for x in batch])
+        c_lens = torch.tensor([len(x["c_ids"]) for x in batch], dtype=torch.long)
+        prompt_lens = torch.tensor([x["prompt_len"] for x in batch], dtype=torch.long)
+        prompt_end_pos = prompt_end_positions_left_pad(
+            c_lens, prompt_lens, c_ids.size(1)
+        )
         return {
             "input_ids_c": c_ids,
             "attention_mask_c": c_mask,
             "input_ids_r": r_ids,
             "attention_mask_r": r_mask,
+            "prompt_end_pos": prompt_end_pos,
         }
 
     train_loader = DataLoader(
